@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.clean.pdf
+*.clean.docx
+*.clean.xlsx
+*.clean.pptx
+cleaned/
+inbox/*
+outbox/*
+!inbox/.gitkeep
+!outbox/.gitkeep
