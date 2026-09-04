@@ -260,6 +260,25 @@ def _text_matrix_rotation_degrees(tm: list) -> float:
     return math.degrees(math.atan2(b, a))
 
 
+def _mat_multiply(m1: list, m2: list) -> list:
+    """Combine two PDF affine matrices: apply m1, then m2 (PDF's `cm`
+    semantics — the operand is applied before whatever the CTM already was).
+    Real-world watermarking tools very often express rotation this way
+    (canvas.rotate() -> a `cm` operator) rather than folding it into the
+    text matrix (`Tm`) directly, so both have to be tracked and combined to
+    get the actually-rendered rotation."""
+    a1, b1, c1, d1, e1, f1 = m1
+    a2, b2, c2, d2, e2, f2 = m2
+    return [
+        a1 * a2 + b1 * c2,
+        a1 * b2 + b1 * d2,
+        c1 * a2 + d1 * c2,
+        c1 * b2 + d1 * d2,
+        e1 * a2 + f1 * c2 + e2,
+        e1 * b2 + f1 * d2 + f2,
+    ]
+
+
 def _scan_pdf_watermarks(pdf, n_pages: int) -> dict:
     import pikepdf
 
@@ -312,13 +331,22 @@ def _scan_pdf_watermarks(pdf, n_pages: int) -> dict:
         extgstates = resources.get("/ExtGState") if resources else None
         current_tm = [1, 0, 0, 1, 0, 0]
         current_alpha = 1.0
+        ctm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        ctm_stack: list[list] = []
         try:
             instructions = pikepdf.parse_content_stream(page)
         except Exception:
             continue
         for ins in instructions:
             op = str(ins.operator)
-            if op == "Tm" and len(ins.operands) == 6:
+            if op == "q":
+                ctm_stack.append(ctm)
+            elif op == "Q":
+                if ctm_stack:
+                    ctm = ctm_stack.pop()
+            elif op == "cm" and len(ins.operands) == 6:
+                ctm = _mat_multiply([float(x) for x in ins.operands], ctm)
+            elif op == "Tm" and len(ins.operands) == 6:
                 current_tm = [float(x) for x in ins.operands]
             elif op == "gs" and extgstates is not None and ins.operands:
                 gs = extgstates.get(str(ins.operands[0]))
@@ -330,14 +358,16 @@ def _scan_pdf_watermarks(pdf, n_pages: int) -> dict:
             elif op in ("Tj", "'", '"') and ins.operands:
                 text = _pdf_string_operand(ins.operands[-1])
                 if text.strip():
+                    rotation = _text_matrix_rotation_degrees(_mat_multiply(current_tm, ctm))
                     text_occurrences.setdefault(text, []).append(
-                        {"page": page_index + 1, "rotation": _text_matrix_rotation_degrees(current_tm), "alpha": current_alpha}
+                        {"page": page_index + 1, "rotation": rotation, "alpha": current_alpha}
                     )
             elif op == "TJ" and ins.operands:
                 text = "".join(_pdf_string_operand(el) for el in ins.operands[0])
                 if text.strip():
+                    rotation = _text_matrix_rotation_degrees(_mat_multiply(current_tm, ctm))
                     text_occurrences.setdefault(text, []).append(
-                        {"page": page_index + 1, "rotation": _text_matrix_rotation_degrees(current_tm), "alpha": current_alpha}
+                        {"page": page_index + 1, "rotation": rotation, "alpha": current_alpha}
                     )
 
     threshold = max(1, n_pages - 1) if n_pages > 1 else 1
