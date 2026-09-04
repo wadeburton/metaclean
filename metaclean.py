@@ -19,6 +19,7 @@ writes back to the Windows clipboard.
 from __future__ import annotations
 
 import argparse
+import math
 import shutil
 import sys
 import unicodedata
@@ -219,6 +220,352 @@ def _default_clean_name(path: str, ext: str) -> str:
     return path + ".clean" + ext
 
 
+# --- pdf watermark detection/removal ----------------------------------------
+#
+# Watermarks are applied to PDFs in several structurally different ways, and
+# only some of them can be undone cleanly:
+#
+#   1. A /Watermark annotation (Acrobat's native "Add Watermark" tool) —
+#      a distinct object; deleting it is clean and exact.
+#   2. An optional-content (layer) group named like "Watermark" — deleting
+#      the layer and the marked-content region that references it is clean.
+#   3. The same image/vector overlay (XObject) drawn on every page — deleting
+#      the draw instruction is clean; the XObject itself is left orphaned
+#      (harmless — pikepdf.save() won't emit unreferenced objects that matter
+#      here, and we don't bother reclaiming the space).
+#   4. Text drawn directly into each page's content stream (no reusable
+#      object at all) — detectable only by heuristic (repeated across pages,
+#      rotated and/or translucent) and removable only by deleting the exact
+#      matching text-show instructions. False positives are possible (e.g. a
+#      repeated running header), so this is opt-in via --aggressive.
+#   5. A watermark baked into a flattened page image (a scan) — not
+#      detectable or removable by this tool at all.
+#
+# find_pdf_watermarks() reports all of 1-4 it can find. strip_pdf_watermarks()
+# always removes 1-3 (high confidence, no visual side effects); 4 only runs
+# under aggressive=True.
+
+def _pdf_string_operand(operand) -> str:
+    try:
+        return str(operand)
+    except Exception:
+        return ""
+
+
+def _text_matrix_rotation_degrees(tm: list) -> float:
+    try:
+        a, b = float(tm[0]), float(tm[1])
+    except (IndexError, TypeError, ValueError):
+        return 0.0
+    return math.degrees(math.atan2(b, a))
+
+
+def _scan_pdf_watermarks(pdf, n_pages: int) -> dict:
+    import pikepdf
+
+    report: dict[str, list] = {
+        "annotations": [], "ocg_layers": [], "repeated_xobjects": [], "heuristic_text": [],
+    }
+
+    for i, page in enumerate(pdf.pages):
+        annots = page.obj.get("/Annots")
+        if not annots:
+            continue
+        for a in annots:
+            if str(a.get("/Subtype", "")) == "/Watermark":
+                report["annotations"].append({"page": i + 1})
+
+    ocp = pdf.Root.get("/OCProperties")
+    if ocp is not None:
+        for ocg in ocp.get("/OCGs", []) or []:
+            name = str(ocg.get("/Name", ""))
+            if "watermark" in name.lower():
+                report["ocg_layers"].append({"name": name})
+
+    xobj_pages: dict[tuple, int] = {}
+    xobj_name: dict[tuple, str] = {}
+    for page in pdf.pages:
+        resources = page.obj.get("/Resources")
+        xobjects = resources.get("/XObject") if resources else None
+        if not xobjects:
+            continue
+        seen = set()
+        for name, ref in xobjects.items():
+            try:
+                key = ref.objgen
+            except AttributeError:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            xobj_pages[key] = xobj_pages.get(key, 0) + 1
+            xobj_name.setdefault(key, str(name))
+    if n_pages > 1:
+        threshold = max(2, n_pages - 1)
+        for key, count in xobj_pages.items():
+            if count >= threshold:
+                report["repeated_xobjects"].append({"name": xobj_name[key], "pages": count, "of": n_pages})
+
+    text_occurrences: dict[str, list[dict]] = {}
+    for page_index, page in enumerate(pdf.pages):
+        resources = page.obj.get("/Resources")
+        extgstates = resources.get("/ExtGState") if resources else None
+        current_tm = [1, 0, 0, 1, 0, 0]
+        current_alpha = 1.0
+        try:
+            instructions = pikepdf.parse_content_stream(page)
+        except Exception:
+            continue
+        for ins in instructions:
+            op = str(ins.operator)
+            if op == "Tm" and len(ins.operands) == 6:
+                current_tm = [float(x) for x in ins.operands]
+            elif op == "gs" and extgstates is not None and ins.operands:
+                gs = extgstates.get(str(ins.operands[0]))
+                if gs is not None and "/ca" in gs:
+                    try:
+                        current_alpha = float(gs["/ca"])
+                    except Exception:
+                        pass
+            elif op in ("Tj", "'", '"') and ins.operands:
+                text = _pdf_string_operand(ins.operands[-1])
+                if text.strip():
+                    text_occurrences.setdefault(text, []).append(
+                        {"page": page_index + 1, "rotation": _text_matrix_rotation_degrees(current_tm), "alpha": current_alpha}
+                    )
+            elif op == "TJ" and ins.operands:
+                text = "".join(_pdf_string_operand(el) for el in ins.operands[0])
+                if text.strip():
+                    text_occurrences.setdefault(text, []).append(
+                        {"page": page_index + 1, "rotation": _text_matrix_rotation_degrees(current_tm), "alpha": current_alpha}
+                    )
+
+    threshold = max(1, n_pages - 1) if n_pages > 1 else 1
+    for text, occurrences in text_occurrences.items():
+        if not (1 <= len(text) <= 80):
+            continue
+        pages_hit = sorted({o["page"] for o in occurrences})
+        rotated = any(abs(o["rotation"]) > 5 for o in occurrences)
+        transparent = any(o["alpha"] < 0.7 for o in occurrences)
+        if len(pages_hit) >= threshold and (rotated or transparent):
+            report["heuristic_text"].append(
+                {"text": text, "pages": pages_hit, "of": n_pages, "rotated": rotated, "transparent": transparent}
+            )
+
+    return report
+
+
+def find_pdf_watermarks(path: str) -> dict:
+    import pikepdf
+
+    with pikepdf.open(path) as pdf:
+        return _scan_pdf_watermarks(pdf, len(pdf.pages))
+
+
+def _strip_marked_content(pdf, page, marked_names: set[str]) -> bool:
+    import pikepdf
+
+    instructions = pikepdf.parse_content_stream(page)
+    out = []
+    depth = 0
+    changed = False
+    for ins in instructions:
+        op = str(ins.operator)
+        if depth == 0 and op == "BDC" and len(ins.operands) >= 2 and str(ins.operands[0]) == "/OC" and str(ins.operands[1]) in marked_names:
+            depth = 1
+            changed = True
+            continue
+        if depth > 0:
+            if op in ("BDC", "BMC"):
+                depth += 1
+            elif op == "EMC":
+                depth -= 1
+            continue
+        out.append(ins)
+    if changed:
+        page.contents_coalesce()
+        page.obj.Contents = pdf.make_stream(pikepdf.unparse_content_stream(out))
+    return changed
+
+
+def _strip_xobject_draws(pdf, page, names_to_strip: set[str]) -> bool:
+    import pikepdf
+
+    instructions = pikepdf.parse_content_stream(page)
+    out = []
+    changed = False
+    for ins in instructions:
+        if str(ins.operator) == "Do" and ins.operands and str(ins.operands[0]) in names_to_strip:
+            changed = True
+            continue
+        out.append(ins)
+    if changed:
+        page.contents_coalesce()
+        page.obj.Contents = pdf.make_stream(pikepdf.unparse_content_stream(out))
+    return changed
+
+
+def _strip_text_runs(pdf, page, texts: set[str]) -> bool:
+    import pikepdf
+
+    instructions = pikepdf.parse_content_stream(page)
+    out = []
+    changed = False
+    for ins in instructions:
+        op = str(ins.operator)
+        if op in ("Tj", "'", '"') and ins.operands and _pdf_string_operand(ins.operands[-1]) in texts:
+            changed = True
+            continue
+        if op == "TJ" and ins.operands:
+            text = "".join(_pdf_string_operand(el) for el in ins.operands[0])
+            if text in texts:
+                changed = True
+                continue
+        out.append(ins)
+    if changed:
+        page.contents_coalesce()
+        page.obj.Contents = pdf.make_stream(pikepdf.unparse_content_stream(out))
+    return changed
+
+
+def strip_pdf_watermarks(in_path: str, out_path: str, aggressive: bool = False) -> dict:
+    import pikepdf
+
+    removed = {"annotations": 0, "ocg_layers": 0, "repeated_xobjects": 0, "heuristic_text": 0}
+
+    with pikepdf.open(in_path) as pdf:
+        n_pages = len(pdf.pages)
+        report = _scan_pdf_watermarks(pdf, n_pages)
+
+        for page in pdf.pages:
+            annots = page.obj.get("/Annots")
+            if not annots:
+                continue
+            keep = [a for a in annots if str(a.get("/Subtype", "")) != "/Watermark"]
+            if len(keep) != len(annots):
+                removed["annotations"] += len(annots) - len(keep)
+                page.obj.Annots = keep
+
+        watermark_ocg_keys = set()
+        ocp = pdf.Root.get("/OCProperties")
+        if ocp is not None and report["ocg_layers"]:
+            kept_ocgs = []
+            for ocg in ocp.get("/OCGs", []) or []:
+                if "watermark" in str(ocg.get("/Name", "")).lower():
+                    watermark_ocg_keys.add(ocg.objgen)
+                    removed["ocg_layers"] += 1
+                else:
+                    kept_ocgs.append(ocg)
+            if watermark_ocg_keys:
+                ocp.OCGs = kept_ocgs
+                d = ocp.get("/D")
+                if d is not None:
+                    for key in ("/ON", "/OFF"):
+                        arr = d.get(key)
+                        if arr:
+                            d[key] = [x for x in arr if x.objgen not in watermark_ocg_keys]
+
+        if watermark_ocg_keys:
+            for page in pdf.pages:
+                resources = page.obj.get("/Resources")
+                properties = resources.get("/Properties") if resources else None
+                if not properties:
+                    continue
+                marked_names = {
+                    str(name) for name, ref in properties.items()
+                    if getattr(ref, "objgen", None) in watermark_ocg_keys
+                }
+                if marked_names:
+                    _strip_marked_content(pdf, page, marked_names)
+
+        if report["repeated_xobjects"]:
+            xobj_pages: dict[tuple, int] = {}
+            for page in pdf.pages:
+                resources = page.obj.get("/Resources")
+                xobjects = resources.get("/XObject") if resources else None
+                if not xobjects:
+                    continue
+                seen = set()
+                for _, ref in xobjects.items():
+                    try:
+                        key = ref.objgen
+                    except AttributeError:
+                        continue
+                    if key not in seen:
+                        seen.add(key)
+                        xobj_pages[key] = xobj_pages.get(key, 0) + 1
+            threshold = max(2, n_pages - 1)
+            watermark_xobj_keys = {k for k, c in xobj_pages.items() if c >= threshold}
+            for page in pdf.pages:
+                resources = page.obj.get("/Resources")
+                xobjects = resources.get("/XObject") if resources else None
+                if not xobjects:
+                    continue
+                names_to_strip = {
+                    str(name) for name, ref in xobjects.items()
+                    if getattr(ref, "objgen", None) in watermark_xobj_keys
+                }
+                if names_to_strip and _strip_xobject_draws(pdf, page, names_to_strip):
+                    removed["repeated_xobjects"] += 1
+
+        if aggressive and report["heuristic_text"]:
+            texts = {h["text"] for h in report["heuristic_text"]}
+            for page in pdf.pages:
+                if _strip_text_runs(pdf, page, texts):
+                    removed["heuristic_text"] += 1
+
+        pdf.save(out_path)
+
+    return removed
+
+
+def cmd_pdf_watermark_find(args: argparse.Namespace) -> int:
+    report = find_pdf_watermarks(args.path)
+    _print_watermark_report(report)
+    return 0
+
+
+def cmd_pdf_watermark_clean(args: argparse.Namespace) -> int:
+    out_path = args.path if args.in_place else (args.out or _default_clean_name(args.path, ".pdf"))
+    removed = strip_pdf_watermarks(args.path, out_path, aggressive=args.aggressive)
+    print(f"Watermarks stripped -> {out_path}", file=sys.stderr)
+    print(f"  annotations removed:       {removed['annotations']}", file=sys.stderr)
+    print(f"  OCG watermark layers:      {removed['ocg_layers']}", file=sys.stderr)
+    print(f"  repeated overlays removed: {removed['repeated_xobjects']}", file=sys.stderr)
+    print(f"  heuristic text runs:       {removed['heuristic_text']}" + ("" if args.aggressive else "  (pass --aggressive to attempt these)"), file=sys.stderr)
+    print(
+        "Note: a watermark baked into a flattened/scanned page image cannot be removed by this tool.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _print_watermark_report(report: dict) -> None:
+    if not any(report.values()):
+        print("No watermark-like structures found (annotations, layers, repeated overlays, or repeated rotated/translucent text).")
+        print("This does NOT rule out a watermark baked directly into a flattened/scanned page image.")
+        return
+
+    if report["annotations"]:
+        pages = ", ".join(str(a["page"]) for a in report["annotations"])
+        print(f"Watermark annotations - pages: {pages}  (safe to remove)")
+    if report["ocg_layers"]:
+        names = ", ".join(o["name"] for o in report["ocg_layers"])
+        print(f"Watermark-named layers (OCGs): {names}  (safe to remove)")
+    if report["repeated_xobjects"]:
+        for x in report["repeated_xobjects"]:
+            print(f"Repeated overlay object '{x['name']}' on {x['pages']}/{x['of']} pages  (safe to remove)")
+    if report["heuristic_text"]:
+        for h in report["heuristic_text"]:
+            traits = []
+            if h["rotated"]:
+                traits.append("rotated")
+            if h["transparent"]:
+                traits.append("translucent")
+            traits_s = "/".join(traits) or "plain"
+            print(f"Possible text watermark {h['text']!r} - {traits_s}, on {len(h['pages'])}/{h['of']} pages  (heuristic - needs --aggressive to remove, may false-positive on repeated headers/footers)")
+
+
 # --- ooxml (docx/xlsx/pptx) mode --------------------------------------------
 
 _OOXML_METADATA_PARTS = ("docProps/core.xml", "docProps/app.xml", "docProps/custom.xml")
@@ -290,24 +637,166 @@ def cmd_ooxml_clean(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- docx header watermark detection/removal --------------------------------
+#
+# Word's built-in "Insert Watermark" feature always places a legacy VML
+# <w:pict> shape into the document's header part(s). This is a very
+# consistent, well-known pattern: text watermarks use <v:textpath> (WordArt
+# on a path), picture watermarks use an absolutely-positioned <v:imagedata>,
+# and Word itself names the shape with an id containing
+# "PowerPlusWaterMarkObject". Any one of those is a reliable, low-false-
+# positive signal — real header content (page numbers, running titles, a
+# logo inserted the normal DrawingML way) doesn't look like this.
+#
+# Scope: docx/dotx/docm headers only. pptx/xlsx watermarks aren't
+# standardized the same way and aren't covered here.
+
+_WATERMARK_ID_MARKER = "PowerPlusWaterMarkObject"
+
+
+def _local_name(tag: str) -> str:
+    return tag.split("}", 1)[-1] if "}" in tag else tag
+
+
+def _find_watermark_picts(root) -> list[dict]:
+    parent_map = {child: parent for parent in root.iter() for child in parent}
+    hits = []
+    for elem in root.iter():
+        if _local_name(elem.tag) != "pict":
+            continue
+        shape = None
+        shape_id = ""
+        has_textpath = False
+        has_absolute_image = False
+        for sub in elem.iter():
+            name = _local_name(sub.tag)
+            if name == "shape" and shape is None:
+                shape = sub
+                shape_id = sub.get("id", "")
+            elif name == "textpath":
+                has_textpath = True
+            elif name == "imagedata":
+                style = shape.get("style", "") if shape is not None else ""
+                if "position:absolute" in style:
+                    has_absolute_image = True
+        if _WATERMARK_ID_MARKER in shape_id or has_textpath or has_absolute_image:
+            hits.append({
+                "element": elem,
+                "parent": parent_map.get(elem),
+                "shape_id": shape_id,
+                "kind": "text" if has_textpath else ("image" if has_absolute_image else "unknown"),
+            })
+    return hits
+
+
+def find_ooxml_watermarks(path: str) -> list[dict]:
+    hits = []
+    with zipfile.ZipFile(path) as zf:
+        header_parts = sorted(
+            n for n in zf.namelist() if n.startswith("word/header") and n.endswith(".xml")
+        )
+        for part in header_parts:
+            root = ET.fromstring(zf.read(part))
+            for hit in _find_watermark_picts(root):
+                hits.append({"part": part, "shape_id": hit["shape_id"], "kind": hit["kind"]})
+    return hits
+
+
+def strip_ooxml_watermarks(in_path: str, out_path: str) -> int:
+    removed = 0
+    with zipfile.ZipFile(in_path) as zin:
+        tmp_out = out_path + ".tmp"
+        with zipfile.ZipFile(tmp_out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename.startswith("word/header") and item.filename.endswith(".xml"):
+                    root = ET.fromstring(data)
+                    hits = _find_watermark_picts(root)
+                    for hit in hits:
+                        parent = hit["parent"]
+                        if parent is not None:
+                            parent.remove(hit["element"])
+                            removed += 1
+                    if hits:
+                        data = ET.tostring(root, xml_declaration=True, encoding="UTF-8")
+                zout.writestr(item, data)
+    Path(tmp_out).replace(out_path)
+    return removed
+
+
+def cmd_ooxml_watermark_find(args: argparse.Namespace) -> int:
+    hits = find_ooxml_watermarks(args.path)
+    if not hits:
+        print(
+            "No Word-style header watermark shapes found. (pptx/xlsx watermarks and "
+            "non-standard docx watermarks aren't covered by this scan.)"
+        )
+        return 0
+    for h in hits:
+        marker = f"  id={h['shape_id']!r}" if h["shape_id"] else ""
+        print(f"{h['part']}: {h['kind']} watermark shape{marker}  (safe to remove)")
+    return 0
+
+
+def cmd_ooxml_watermark_clean(args: argparse.Namespace) -> int:
+    p = Path(args.path)
+    out_path = args.path if args.in_place else (args.out or _default_clean_name(args.path, p.suffix.lower()))
+    removed = strip_ooxml_watermarks(args.path, out_path)
+    print(f"Removed {removed} watermark shape(s) -> {out_path}", file=sys.stderr)
+    if removed == 0:
+        print(
+            "Note: no Word-style header watermark was found. A picture/text box added "
+            "by hand, or a pptx/xlsx watermark, isn't covered by this scan.",
+            file=sys.stderr,
+        )
+    return 0
+
+
 # --- auto (drag-and-drop) mode ---------------------------------------------
 
 TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log"}
+DOCX_WATERMARK_EXTENSIONS = {".docx", ".dotx", ".docm"}
 
 
-def _clean_one_file(src: Path, dest: Path) -> str:
+def _clean_one_file(src: Path, dest: Path, strip_watermarks: bool = False) -> str:
     """Clean src into dest (dest's parent is created if needed). Returns a
     short status string describing what happened."""
+    import os
+    import tempfile
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     ext = src.suffix.lower()
 
     if ext == ".pdf":
-        strip_pdf_metadata(str(src), str(dest))
-        return "PDF metadata stripped"
+        if not strip_watermarks:
+            strip_pdf_metadata(str(src), str(dest))
+            return "PDF metadata stripped"
+        fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        try:
+            strip_pdf_metadata(str(src), tmp_path)
+            removed = strip_pdf_watermarks(tmp_path, str(dest))
+            total = sum(removed.values())
+            status = "PDF metadata stripped"
+            status += f", {total} watermark element(s) removed" if total else ", no removable watermark structures found"
+            return status
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
 
     if ext in OOXML_EXTENSIONS or (ext not in TEXT_EXTENSIONS and _is_ooxml(str(src))):
-        strip_ooxml_metadata(str(src), str(dest))
-        return "Office document metadata stripped"
+        if not (strip_watermarks and ext in DOCX_WATERMARK_EXTENSIONS):
+            strip_ooxml_metadata(str(src), str(dest))
+            return "Office document metadata stripped"
+        fd, tmp_path = tempfile.mkstemp(suffix=ext)
+        os.close(fd)
+        try:
+            strip_ooxml_metadata(str(src), tmp_path)
+            removed = strip_ooxml_watermarks(tmp_path, str(dest))
+            status = "Office document metadata stripped"
+            status += f", {removed} watermark shape(s) removed" if removed else ", no header watermark found"
+            return status
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
 
     if ext in TEXT_EXTENSIONS:
         content = src.read_text(encoding="utf-8", errors="replace")
@@ -339,7 +828,7 @@ def cmd_auto(args: argparse.Namespace) -> int:
     ok, failed = 0, 0
     for src, dest in jobs:
         try:
-            status = _clean_one_file(src, dest)
+            status = _clean_one_file(src, dest, strip_watermarks=args.watermarks)
             print(f"[ok]   {src.name}: {status} -> {dest}")
             ok += 1
             if mode == "inbox":
@@ -379,6 +868,20 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--in-place", action="store_true", help="overwrite the input file")
     p_pdf_clean.set_defaults(func=cmd_pdf_clean)
 
+    p_pdf_wm_find = pdf_sub.add_parser("watermark-find", help="scan for removable watermark structures")
+    p_pdf_wm_find.add_argument("path")
+    p_pdf_wm_find.set_defaults(func=cmd_pdf_watermark_find)
+    p_pdf_wm_clean = pdf_sub.add_parser("watermark-clean", help="strip watermark structures")
+    p_pdf_wm_clean.add_argument("path")
+    p_pdf_wm_clean.add_argument(
+        "--aggressive", action="store_true",
+        help="also strip heuristically-detected repeated rotated/translucent text (may false-positive)",
+    )
+    group_wm = p_pdf_wm_clean.add_mutually_exclusive_group()
+    group_wm.add_argument("--out", help="output path (default: <name>.clean.pdf)")
+    group_wm.add_argument("--in-place", action="store_true", help="overwrite the input file")
+    p_pdf_wm_clean.set_defaults(func=cmd_pdf_watermark_clean)
+
     p_ooxml = sub.add_parser("ooxml", help="find/strip docx/xlsx/pptx metadata")
     ooxml_sub = p_ooxml.add_subparsers(dest="ooxml_mode", required=True)
     p_ooxml_find = ooxml_sub.add_parser("find", help="print docProps metadata")
@@ -391,8 +894,22 @@ def build_parser() -> argparse.ArgumentParser:
     group2.add_argument("--in-place", action="store_true", help="overwrite the input file")
     p_ooxml_clean.set_defaults(func=cmd_ooxml_clean)
 
+    p_ooxml_wm_find = ooxml_sub.add_parser("watermark-find", help="scan docx headers for watermark shapes")
+    p_ooxml_wm_find.add_argument("path")
+    p_ooxml_wm_find.set_defaults(func=cmd_ooxml_watermark_find)
+    p_ooxml_wm_clean = ooxml_sub.add_parser("watermark-clean", help="strip docx header watermark shapes")
+    p_ooxml_wm_clean.add_argument("path")
+    group3 = p_ooxml_wm_clean.add_mutually_exclusive_group()
+    group3.add_argument("--out", help="output path (default: <name>.clean.<ext>)")
+    group3.add_argument("--in-place", action="store_true", help="overwrite the input file")
+    p_ooxml_wm_clean.set_defaults(func=cmd_ooxml_watermark_clean)
+
     p_auto = sub.add_parser("auto", help="drag-and-drop dispatcher: clean by extension")
     p_auto.add_argument("paths", nargs="*", help="files to clean; if omitted, process inbox/")
+    p_auto.add_argument(
+        "--watermarks", action="store_true",
+        help="also attempt watermark removal (PDF: annotations/layers/repeated overlays; docx: header watermark shapes)",
+    )
     p_auto.set_defaults(func=cmd_auto)
 
     return parser
